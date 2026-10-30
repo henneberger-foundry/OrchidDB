@@ -1,6 +1,6 @@
 [package]
 name = "orchiddb-duckdb-functions"
-version = "0.6.0-foundry"
+version = "0.6.0-foundry.1"
 edition = "2024"
 publish = false
 license = "GPL-3.0-only"
