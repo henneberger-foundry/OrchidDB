@@ -62,6 +62,7 @@ impl DialectAdapter for TrinoAdapter {
             .collect::<Vec<_>>()
             .join("; ");
         let mut tokens = Tokenizer::new(&TrinoParser, &sql)
+            .with_unescape(false)
             .tokenize()
             .map_err(|e| SqlError::Unsupported(e.to_string()))?;
         let significant = tokens
@@ -88,6 +89,14 @@ impl DialectAdapter for TrinoAdapter {
         schema: arrow::datatypes::SchemaRef,
     ) -> SqlResult<Option<std::sync::Arc<dyn datafusion::catalog::TableProvider>>> {
         connectors::provider(metadata, schema)
+    }
+    fn bind_source_arguments(
+        &self,
+        metadata: &crate::ir::rel::source_metadata::SourceMetadata,
+        arguments: &std::collections::BTreeMap<String, serde_json::Value>,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> SqlResult<Option<std::sync::Arc<dyn datafusion::catalog::TableProvider>>> {
+        connectors::bind_arguments(metadata, arguments, schema)
     }
     fn requires_scope_repair(&self) -> bool {
         true
@@ -357,13 +366,9 @@ impl DialectAdapter for TrinoAdapter {
                     .iter()
                     .filter_map(|p| p.as_ident())
                     .collect::<Vec<_>>();
-                if parts.len() == 3
-                    && parts[1].value == "system"
-                    && matches!(
-                        parts[2].value.as_str(),
-                        "query_range" | "table_changes" | "raw_query" | "query"
-                    )
-                {
+                // Fully qualified calls identify native connector functions supplied
+                // by source metadata, rather than portable logical functions.
+                if parts.len() == 3 {
                     return Ok(());
                 }
 
@@ -387,6 +392,8 @@ impl DialectAdapter for TrinoAdapter {
                     | "count"
                     | "sum"
                     | "avg"
+                    | "bool_or"
+                    | "bool_and"
                     | "min"
                     | "max"
                     | "array_agg"

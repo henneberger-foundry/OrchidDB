@@ -13,6 +13,24 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "connector", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ConnectorSource {
+    /// A typed relation backed by a Trino table function. Arguments are literal
+    /// values from schema configuration; query predicates remain in SQL.
+    TableFunction {
+        catalog: String,
+        schema: String,
+        function: String,
+        #[serde(default)]
+        arguments: std::collections::BTreeMap<String, serde_json::Value>,
+        #[serde(default)]
+        argument_columns: std::collections::BTreeMap<String, String>,
+    },
+    Table {
+        catalog: String,
+        schema: String,
+        table: String,
+        #[serde(default)]
+        json_columns: std::collections::BTreeSet<String>,
+    },
     Iceberg {
         catalog: String,
         schema: String,
@@ -90,6 +108,55 @@ impl ConnectorSource {
             format!("TABLE({}.system.{name}({arguments}))", q(catalog))
         };
         Ok(match self {
+            Self::TableFunction {
+                catalog,
+                schema,
+                function,
+                arguments,
+                ..
+            } => {
+                if [catalog, schema, function]
+                    .iter()
+                    .any(|name| name.is_empty())
+                {
+                    return Err(invalid("table function identifiers must be nonempty"));
+                }
+                let arguments = arguments
+                    .iter()
+                    .map(|(name, value)| {
+                        if name.is_empty() {
+                            return Err(invalid("argument name must be nonempty"));
+                        }
+                        let literal = match value {
+                            serde_json::Value::Null => "NULL".into(),
+                            serde_json::Value::Bool(value) => {
+                                if *value { "TRUE" } else { "FALSE" }.into()
+                            }
+                            serde_json::Value::Number(value) => value.to_string(),
+                            serde_json::Value::String(value) => string(value),
+                            _ => {
+                                return Err(invalid(
+                                    "table function arguments must be scalar JSON literals",
+                                ));
+                            }
+                        };
+                        Ok(format!("{} => {literal}", q(name)))
+                    })
+                    .collect::<SqlResult<Vec<_>>>()?
+                    .join(", ");
+                format!(
+                    "TABLE({}.{}.{}({arguments}))",
+                    q(catalog),
+                    q(schema),
+                    q(function)
+                )
+            }
+            Self::Table { catalog, schema, table: name, .. } => {
+                if [catalog, schema, name].iter().any(|name| name.is_empty()) {
+                    return Err(invalid("table identifiers must be nonempty"));
+                }
+                table(catalog, schema, name)
+            }
             Self::Iceberg {
                 catalog,
                 schema,
@@ -287,6 +354,22 @@ impl ConnectorSource {
     fn column(&self, name: &str, ty: &DataType) -> SqlResult<String> {
         let q = TRINO.quote_ident(name);
         Ok(match self {
+            Self::Table { json_columns, .. } => {
+                let value = if json_columns.contains(name) { format!("json_format({q})") } else { q };
+                format!("CAST({value} AS {})", TRINO.sql_type(ty)?)
+            }
+            Self::TableFunction { arguments, argument_columns, .. } if argument_columns.contains_key(name) => {
+                let argument = &argument_columns[name];
+                let value = arguments.get(argument).ok_or_else(|| invalid(&format!("argument {argument} is required for column {name}")))?;
+                let literal = match value {
+                    serde_json::Value::Null => "NULL".into(),
+                    serde_json::Value::Bool(v) => if *v { "TRUE" } else { "FALSE" }.into(),
+                    serde_json::Value::Number(v) => v.to_string(),
+                    serde_json::Value::String(v) => string(v),
+                    _ => return Err(invalid("argument columns require scalar arguments")),
+                };
+                format!("CAST({literal} AS {})", TRINO.sql_type(ty)?)
+            }
             Self::Loki { .. } | Self::Prometheus { .. } => match name {
                 "timestamp" => format!(
                     "CAST(timestamp AT TIME ZONE 'UTC' AS {})",
@@ -347,6 +430,19 @@ pub(super) fn provider(
         serde_json::to_value(&metadata.options).map_err(|e| invalid(&e.to_string()))?,
     )
     .map_err(|e| invalid(&e.to_string()))?;
+    source.provider(schema).map(Some)
+}
+pub(super) fn bind_arguments(
+    metadata: &crate::ir::rel::source_metadata::SourceMetadata,
+    supplied: &std::collections::BTreeMap<String, serde_json::Value>,
+    schema: arrow::datatypes::SchemaRef,
+) -> SqlResult<Option<Arc<dyn TableProvider>>> {
+    if metadata.format.as_deref() != Some("trino") { return Ok(None); }
+    let mut source: ConnectorSource = serde_json::from_value(
+        serde_json::to_value(&metadata.options).map_err(|e| invalid(&e.to_string()))?,
+    ).map_err(|e| invalid(&e.to_string()))?;
+    let ConnectorSource::TableFunction { arguments, .. } = &mut source else { return Ok(None); };
+    for (name, value) in supplied { arguments.insert(name.to_ascii_uppercase(), value.clone()); }
     source.provider(schema).map(Some)
 }
 fn connector(provider: &Arc<dyn TableProvider>) -> Option<&ConnectorProvider> {
