@@ -354,13 +354,9 @@ impl DialectAdapter for TrinoAdapter {
                     .iter()
                     .filter_map(|p| p.as_ident())
                     .collect::<Vec<_>>();
-                if parts.len() == 3
-                    && parts[1].value == "system"
-                    && matches!(
-                        parts[2].value.as_str(),
-                        "query_range" | "table_changes" | "raw_query" | "query"
-                    )
-                {
+                // Fully qualified calls identify native connector functions supplied
+                // by source metadata, rather than portable logical functions.
+                if parts.len() == 3 {
                     return Ok(());
                 }
 
@@ -384,6 +380,8 @@ impl DialectAdapter for TrinoAdapter {
                     | "count"
                     | "sum"
                     | "avg"
+                    | "bool_or"
+                    | "bool_and"
                     | "min"
                     | "max"
                     | "array_agg"
