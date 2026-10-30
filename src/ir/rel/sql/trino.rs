@@ -489,6 +489,7 @@ impl DialectAdapter for TrinoAdapter {
                     | "count"
                     | "sum"
                     | "avg"
+                    | "unnest"
                     | "bool_or"
                     | "bool_and"
                     | "min"
