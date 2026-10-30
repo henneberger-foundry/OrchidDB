@@ -5,7 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestSourceOpenErrorWithTypedNilCursor(t *testing.T) {
@@ -25,14 +30,14 @@ func sourceFixture(local bool) sourcePlan {
 	if local {
 		nodes = append(nodes, sourceNode{Kind: "local_project", Input: 0, Columns: []exchangeColumn{col}, Expressions: []sourceExpr{{Kind: "call", Function: "twice", Returns: "int64", Arguments: []sourceExpr{{Kind: "column", Index: 0}}}}})
 	}
-	return sourcePlan{Version: 1, Engine: "none", Nodes: nodes, Result: len(nodes) - 1}
+	return sourcePlan{Version: 1, Nodes: nodes, Result: len(nodes) - 1}
 }
 func TestSourceFirstNoCompletion(t *testing.T) {
-	for _, engine := range []string{"none", "duckdb"} {
-		t.Run(engine, func(t *testing.T) {
+	for _, local := range []bool{false, true} {
+		t.Run(fmt.Sprintf("local=%v", local), func(t *testing.T) {
 			calls := 0
 			closed := 0
-			c := &SourceConnection{config: SourceConfig{Engine: engine, Sources: map[string]SQLSource{"db": {Dialect: "postgres", Query: func(_ context.Context, sql string, _ ...any) (RowCursor, error) {
+			c := &SourceConnection{config: SourceConfig{Sources: map[string]SQLSource{"db": {Dialect: "postgres", Query: func(_ context.Context, sql string, _ ...any) (RowCursor, error) {
 				calls++
 				if sql != "SELECT id FROM people" {
 					t.Fatal(sql)
@@ -43,7 +48,7 @@ func TestSourceFirstNoCompletion(t *testing.T) {
 				t.Fatal("DuckDB called")
 				return nil, errors.New("unexpected engine")
 			}}}
-			rows, err := c.execute(context.Background(), sourceFixture(true))
+			rows, err := c.execute(context.Background(), sourceFixture(local))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -55,7 +60,11 @@ func TestSourceFirstNoCompletion(t *testing.T) {
 				}
 				got = append(got, value)
 			}
-			if rows.Err() != nil || len(got) != 2 || got[0] != 2 || got[1] != 4 || calls != 1 || closed != 1 {
+			want := int64(1)
+			if local {
+				want = 2
+			}
+			if rows.Err() != nil || len(got) != 2 || got[0] != want || got[1] != want*2 || calls != 1 || closed != 1 {
 				t.Fatalf("%v calls=%d closed=%d err=%v", got, calls, closed, rows.Err())
 			}
 		})
@@ -63,12 +72,81 @@ func TestSourceFirstNoCompletion(t *testing.T) {
 }
 func TestSourceFirstPreflight(t *testing.T) {
 	calls := 0
-	c := &SourceConnection{config: SourceConfig{Engine: "none", Sources: map[string]SQLSource{"db": {Dialect: "postgres", Query: func(context.Context, string, ...any) (RowCursor, error) { calls++; return nil, nil }}}}}
+	c := &SourceConnection{config: SourceConfig{Sources: map[string]SQLSource{"db": {Dialect: "postgres", Query: func(context.Context, string, ...any) (RowCursor, error) { calls++; return nil, nil }}}}}
 	if _, err := c.execute(context.Background(), sourceFixture(true)); err == nil {
 		t.Fatal("missing UDF accepted")
 	}
 	if calls != 0 {
 		t.Fatal("source called before validation")
+	}
+}
+
+func TestSourceConnectionWithNativeRuntime(t *testing.T) {
+	library := os.Getenv("ORCHIDDB_NATIVE_LIBRARY")
+	if library == "" {
+		t.Skip("set ORCHIDDB_NATIVE_LIBRARY to test the real runtime")
+	}
+	schema := json.RawMessage(`{"sources":{"db":{"adapter":"postgres"}},
+		"tables":[{"name":"people","source":"db","columns":[{"name":"id","data_type":"int64"}]}],
+		"nodes":[{"label":"Person","table":"people","id":"id","properties":{"id":"id"}}],
+		"functions":[{"name":"twice","target":"twice","parameters":["int64"],"returns":"int64","local":true}]}`)
+	sourceCalls, functionCalls := 0, 0
+	graph, err := NewSourceConnection(schema, SourceConfig{
+		Library: library,
+		Sources: map[string]SQLSource{"db": {Dialect: "postgres", Query: func(_ context.Context, sql string, _ ...any) (RowCursor, error) {
+			sourceCalls++
+			if strings.Contains(sql, "twice") {
+				t.Fatal("local function sent to source")
+			}
+			i := 0
+			return &localRows{columns: []string{"id"}, next: func() ([]any, bool, error) { i++; return []any{int64(i)}, i <= 2, nil }}, nil
+		}}},
+		Functions: map[string]LocalFunction{"twice": func(_ context.Context, args []any) (any, error) {
+			functionCalls++
+			return args[0].(int64) * 2, nil
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer graph.Close()
+	// A residual filter selects DuckDB automatically; missing bindings fail before effects.
+	if _, err := graph.Query(context.Background(), "MATCH (p:Person) WHERE twice(p.id) > 2 RETURN p.id", QueryOptions{}); err == nil || !strings.Contains(err.Error(), "DuckDB") {
+		t.Fatalf("expected missing completion binding: %v", err)
+	}
+	if sourceCalls != 0 || functionCalls != 0 {
+		t.Fatal("callbacks ran before completion preflight")
+	}
+	rows, err := graph.Query(context.Background(), "MATCH (p:Person) RETURN p.id AS id", QueryOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []int64
+	for rows.Next() {
+		var n int64
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, n)
+	}
+	if rows.Err() != nil || len(got) != 2 || got[0] != 1 || got[1] != 2 || sourceCalls != 1 || functionCalls != 0 {
+		t.Fatalf("values=%v source=%d function=%d error=%v", got, sourceCalls, functionCalls, rows.Err())
+	}
+	local, err := graph.Query(context.Background(), "RETURN twice($n) AS answer", QueryOptions{Parameters: map[string]any{"n": 21}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	var answer int64
+	if !local.Next() {
+		t.Fatalf("missing local result: %v", local.Err())
+	}
+	if err := local.Scan(&answer); err != nil {
+		t.Fatal(err)
+	}
+	if answer != 42 || local.Next() || local.Err() != nil || sourceCalls != 1 || functionCalls != 1 {
+		t.Fatalf("answer=%d source=%d function=%d error=%v", answer, sourceCalls, functionCalls, local.Err())
 	}
 }
 func TestSourceRequestBinding(t *testing.T) {
@@ -109,5 +187,70 @@ func TestGraphDescriptorUsesDriverRowFields(t *testing.T) {
 	}
 	if graphDescriptor(privateDriverRow{}) != nil {
 		t.Fatal("null ROW lost")
+	}
+}
+
+func TestSourceColumnsPreserveEmptyCompletionInputs(t *testing.T) {
+	opened := 0
+	col := exchangeColumn{Name: "value", DataType: json.RawMessage(`"list:timestamptz"`), Nullable: true}
+	plan := sourcePlan{Version: 1, Result: 1, Nodes: []sourceNode{
+		{Kind: "source_sql", Source: "db", Dialect: "postgres", SQL: "SELECT value FROM empty", Columns: []exchangeColumn{col}},
+		{Kind: "duckdb", SQL: "SELECT * FROM incoming", Columns: []exchangeColumn{col}},
+	}}
+	plan.Nodes[1].Inputs = append(plan.Nodes[1].Inputs, struct {
+		Name string `json:"name"`
+		Node int    `json:"node"`
+	}{"incoming", 0})
+	c := &SourceConnection{config: SourceConfig{Sources: map[string]SQLSource{"db": {Dialect: "postgres", Query: func(context.Context, string, ...any) (RowCursor, error) {
+		opened++
+		return &localRows{columns: []string{"value"}, next: func() ([]any, bool, error) { return nil, false, nil }}, nil
+	}}}, Completion: func(_ context.Context, _ string, inputs map[string]RowCursor) (RowCursor, error) {
+		cols, err := SourceColumns(inputs["incoming"])
+		if err != nil || len(cols) != 1 || string(cols[0].DataType) != `"list:timestamptz"` || !cols[0].Nullable || opened != 0 {
+			t.Fatalf("empty input schema lost or opened early: %+v, %v, opened=%d", cols, err, opened)
+		}
+		return inputs["incoming"], nil
+	}}}
+	rows, err := c.execute(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	cols, err := SourceColumns(rows)
+	if err != nil || cols[0].Name != "value" {
+		t.Fatal(cols, err)
+	}
+	cols[0].DataType[1] = 'X'
+	original, _ := SourceColumns(rows)
+	if string(original[0].DataType) != `"list:timestamptz"` {
+		t.Fatal("schema aliased caller memory")
+	}
+	if rows.Next() || rows.Err() != nil || opened != 1 {
+		t.Fatal("empty cursor failed", rows.Err(), opened)
+	}
+}
+
+func TestSourceSpoolPreservesTemporalAndNestedValues(t *testing.T) {
+	stamp := time.Date(2026, 10, 29, 1, 2, 3, 123456000, time.UTC)
+	expected := []any{stamp, []any{nil, stamp}, map[string]any{"exact": json.Number("9007199254740993")}}
+	first := true
+	input := &localRows{columns: []string{"stamp", "list", "map"}, next: func() ([]any, bool, error) {
+		if !first {
+			return nil, false, nil
+		}
+		first = false
+		return expected, true, nil
+	}}
+	rows := spoolSourceRows(input)
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal(rows.Err())
+	}
+	actual, err := readSourceRow(rows)
+	if err != nil || !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("spool changed typed values: %#v, %v", actual, err)
+	}
+	if rows.Next() || rows.Err() != nil {
+		t.Fatal(rows.Err())
 	}
 }

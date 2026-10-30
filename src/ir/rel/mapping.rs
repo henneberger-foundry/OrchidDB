@@ -21,17 +21,20 @@
 //!
 //! Data access is engine-neutral:
 //!
-//! * **In-process (DataFusion)**: register real providers
+//! * **Arrow providers**: register typed providers
 //!   ([`register_table`](GraphMapping::register_table) with a `MemTable`, or
-//!   [`register_view`](GraphMapping::register_view) for a SQL-defined view)
-//!   and execute the lowered plan directly.
-//! * **External SQL (DuckDB/Postgres)**: the same table names are assumed to
+//!   [`register_view`](GraphMapping::register_view) for a SQL-defined view).
+//!   DataFusion supplies logical planning; DuckDB completes relational work.
+//! * **Source SQL (DuckDB/PostgreSQL/Trino)**: the same table names are assumed to
 //!   exist in the target database;
 //!   [`physical_table_names`](GraphMapping::physical_table_names) tells the
 //!   SQL layer which scan leaves must *not* be materialized because they are
 //!   the user's own tables/views.
 //!
 //! A mapping can be built programmatically or loaded from TOML via [`GraphMapping::from_toml`] (see the docs for the format).
+//!
+//! SQL audit [L02](../../../tools/diagnostics/sql-lowering-audit.md#l02-graph-scans-and-physical-identity): The naming/identity projection is a logical contract. Later demand and
+//! constant-key proofs may remove its physical SQL columns and comparisons.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -45,7 +48,7 @@ use datafusion::common::{DFSchema, TableReference};
 use datafusion::datasource::{MemTable, provider_as_source};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::{
-    AggregateUDF, Cast, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, TableSource, WindowUDF,
+    AggregateUDF, Cast, Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, ScalarUDF, TableSource, WindowUDF,
 };
 use datafusion::prelude::lit;
 use datafusion::scalar::ScalarValue;
@@ -1648,10 +1651,7 @@ fn endpoint_expr(
         .map_err(RelError::Unsupported)?;
     // Endpoint columns may have different source widths. Normalize each tuple
     // to its node mapping before joins or heterogeneous identity widening.
-    Ok(Expr::Cast(Cast::new(
-        Box::new(id_expr(plan, columns, what)?),
-        kind,
-    )))
+    Ok(id_expr(plan, columns, what)?.cast_to(&kind, plan.schema())?)
 }
 
 fn is_integer_type(data_type: &DataType) -> bool {
