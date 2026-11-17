@@ -32,6 +32,11 @@ pub enum ConnectorSource {
         json_columns: std::collections::BTreeSet<String>,
     },
     Iceberg {
+        /// Named Iceberg branch; mutually exclusive with other time-travel selectors.
+        #[serde(default)]
+        branch: Option<String>,
+        #[serde(default)]
+        json_columns: std::collections::BTreeSet<String>,
         catalog: String,
         schema: String,
         table: String,
@@ -164,9 +169,14 @@ impl ConnectorSource {
                 snapshot,
                 timestamp_as_of,
                 metadata,
+                branch,
+                ..
             } => {
-                if [snapshot.is_some(), timestamp_as_of.is_some(), metadata.is_some()].into_iter().filter(|v| *v).count() > 1 {
-                    return Err(invalid("snapshot, timestamp_as_of and metadata are mutually exclusive"));
+                if [snapshot.is_some(), timestamp_as_of.is_some(), metadata.is_some(), branch.is_some()].into_iter().filter(|v| *v).count() > 1 {
+                    return Err(invalid("branch, snapshot, timestamp_as_of and metadata are mutually exclusive"));
+                }
+                if [catalog, schema, name].iter().any(|name| name.is_empty()) {
+                    return Err(invalid("table identifiers must be nonempty"));
                 }
                 let mut name = name.clone();
                 if let Some(suffix) = metadata {
@@ -196,6 +206,16 @@ impl ConnectorSource {
                         .with_timezone(&chrono::Utc);
                     let keyword = if ast_form { "TIMESTAMP" } else { "FOR TIMESTAMP" };
                     sql.push_str(&format!(" {keyword} AS OF TIMESTAMP {}", string(&time.format("%Y-%m-%d %H:%M:%S%.9f UTC").to_string())));
+                }
+                if let Some(branch) = branch {
+                    if branch.trim().is_empty() || branch.contains('\0') {
+                        return Err(invalid("Iceberg branch must be nonempty and contain no NUL"));
+                    }
+                    // sqlparser restricts VERSION AS OF to numeric literals. Its
+                    // SYSTEM_TIME AST carries an expression; the Trino finalizer
+                    // renders this named-reference form as FOR VERSION AS OF.
+                    let keyword = if ast_form { "FOR SYSTEM_TIME" } else { "FOR VERSION" };
+                    sql.push_str(&format!(" {keyword} AS OF {}", string(branch)));
                 }
                 if let Some(id) = snapshot {
                     if *id < 0 {
@@ -354,7 +374,7 @@ impl ConnectorSource {
     fn column(&self, name: &str, ty: &DataType) -> SqlResult<String> {
         let q = TRINO.quote_ident(name);
         Ok(match self {
-            Self::Table { json_columns, .. } => {
+            Self::Table { json_columns, .. } | Self::Iceberg { json_columns, .. } => {
                 let value = if json_columns.contains(name) { format!("json_format({q})") } else { q };
                 format!("CAST({value} AS {})", TRINO.sql_type(ty)?)
             }

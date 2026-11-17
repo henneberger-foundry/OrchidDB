@@ -499,3 +499,26 @@ async fn recursive_paths_preserve_declared_base_types() {
         assert_eq!(execute(&sql), vec![json!({"name":"B"}),json!({"name":"C"})]);
     }
 }
+
+#[tokio::test]
+async fn iceberg_branch_is_a_typed_source_selector() {
+    let result = connector_query(
+        json!({"connector":"iceberg","catalog":"lake","schema":"foundry_cdc","table":"public__customer","branch":"agent's-review"}),
+        json!([{"name":"id","data_type":"string"},{"name":"name","data_type":"string"}]),
+        "MATCH (n:Item) RETURN n.id AS id, n.name AS name",
+    ).await;
+    let sql = result["sql"].as_str().unwrap();
+    assert!(sql.contains("FOR VERSION AS OF 'agent''s-review'"), "{sql}");
+    assert!(sql.contains("\"lake\".\"foundry_cdc\".\"public__customer\""), "{sql}");
+}
+
+#[test]
+fn iceberg_branch_rejects_ambiguous_or_empty_selectors() {
+    use orchiddb::ir::rel::sql::trino::connectors::ConnectorSource;
+    for extra in [json!({"branch":""}), json!({"branch":"a","snapshot":1}), json!({"branch":"a","timestamp_as_of":"2026-11-17T00:00:00Z"}), json!({"branch":"a","metadata":"refs"})] {
+        let mut value = json!({"connector":"iceberg","catalog":"lake","schema":"db","table":"records"});
+        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let source: ConnectorSource = serde_json::from_value(value).unwrap();
+        assert!(source.relation_sql().is_err());
+    }
+}
